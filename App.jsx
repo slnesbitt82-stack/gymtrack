@@ -1,6 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { createRoot } from "react-dom/client";
-import { createRoot } from "react-dom/client";
 
 // ── DATA ────────────────────────────────────────────────────────────────────
 
@@ -5530,9 +5529,122 @@ function TrainingPlanner({ profile, onUpdateProfile }) {
   );
 }
 
-// Mount
-const _root = document.getElementById("root");
-if (_root) createRoot(_root).render(<App />);
+// ── MAIN APP ─────────────────────────────────────────────────────────────────
+
+export default function App() {
+  const [profile, setProfile] = useStorage("gymnast_profile", null);
+  const [screen, setScreen]   = useState("home");
+  const [skillProgress, setSkillProgress] = useStorage("skill_progress", {});
+  const [videos, setVideos]   = useStorage("video_library", []);
+
+  const todayKey = "conditioning_" + new Date().toDateString();
+  const [checkedToday] = useStorage(todayKey, []);
+
+  const [globalXP, setGlobalXP] = useStorage("total_xp_cache", 0);
+  const [xpBump, setXpBump]     = useState(null);
+
+  const handleOnboard  = (data) => setProfile(data);
+  const updateProfile  = (data) => setProfile(data);
+  const handleSetSkills = (fn) => setSkillProgress(typeof fn === "function" ? fn(skillProgress) : fn);
+  const handleXPGain   = (amount) => {
+    setGlobalXP(prev => prev + amount);
+    setXpBump(amount);
+    setTimeout(() => setXpBump(null), 1800);
+  };
+
+  const accentColor = profile?.accentColor || "#c97fd4";
+
+  useEffect(() => {
+    if (profile?.accentColor) {
+      document.documentElement.style.setProperty("--accent", profile.accentColor);
+      document.documentElement.style.setProperty("--accent-dim", profile.accentColor + "22");
+    }
+  }, [profile?.accentColor]);
+
+  useEffect(() => {
+    setGlobalSkinTone(profile?.skinTone || "");
+  }, [profile?.skinTone]);
+
+  const si = profile?.screenIcons || {};
+  const NAV = [
+    { id: "home",         label: "Home",     icon: si.home         || "🏠" },
+    { id: "skills",       label: "Skills",   icon: si.skills       || "🎯" },
+    { id: "conditioning", label: "Train",    icon: si.conditioning || "💪" },
+    { id: "planner",      label: "Plan",     icon: si.planner      || "📅" },
+    { id: "progress",     label: "Progress", icon: si.progress     || "📈" },
+    { id: "achievements", label: "Awards",   icon: si.achievements || "🏆" },
+  ];
+
+  const CSS = `
+    :root { --bg: #0f0e17; --card: #1a1929; --border: #2d2b44; --text: #f0eeff; --muted-text: #7a78a0; --muted: #2d2b44; --input-bg: #13121f; --accent: ${accentColor}; --accent-dim: ${accentColor}22; --font-display: 'Georgia', serif; --font-body: system-ui, sans-serif; }
+    * { margin: 0; padding: 0; box-sizing: border-box; } body { background: var(--bg); font-family: var(--font-body); }
+    input { font-family: var(--font-body); outline: none; } button { font-family: var(--font-body); }
+    ::-webkit-scrollbar { width: 4px; } ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+    @keyframes toastIn { from { opacity:0; transform: translateX(-50%) translateY(-12px); } to { opacity:1; transform: translateX(-50%) translateY(0); } }
+  `;
+
+  if (!profile) return (
+    <>
+      <style>{CSS}</style>
+      <Onboarding onComplete={handleOnboard} />
+    </>
+  );
+
+  return (
+    <>
+      <style>{CSS}</style>
+
+      {/* ── Header ── */}
+      <div style={{ position: "sticky", top: 0, zIndex: 100, background: "var(--bg)", borderBottom: "1px solid var(--border)", padding: "14px 20px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div style={{ fontFamily: "var(--font-display)", color: "var(--accent)", fontSize: 20, letterSpacing: 1 }}>✦ GymTrack</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {xpBump && (
+            <div style={{ background: "var(--accent)", color: "#fff", borderRadius: 20, padding: "2px 10px", fontSize: 11, fontWeight: 700, animation: "toastIn .2s ease" }}>
+              +{xpBump} XP
+            </div>
+          )}
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end" }}>
+            <span style={{ color: "var(--muted-text)", fontSize: 11 }}>{profile.name}</span>
+            <span style={{ color: getXPLevel(globalXP).color, fontSize: 10, fontWeight: 700 }}>{getXPLevel(globalXP).title}</span>
+          </div>
+          <div onClick={() => setScreen("home")} style={{ width: 32, height: 32, borderRadius: 10, background: "var(--accent-dim)", border: `2px solid var(--accent)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, cursor: "pointer" }}>{t(profile.icon)}</div>
+        </div>
+      </div>
+
+      {/* ── Content ── */}
+      <div style={{ minHeight: "calc(100vh - 128px)", overflowY: "auto" }}>
+        {screen === "home"         && <Home profile={profile} onUpdateProfile={updateProfile} onNavigate={setScreen} />}
+        {screen === "dashboard"    && <Dashboard profile={profile} skillProgress={skillProgress} checkedToday={checkedToday} />}
+        {screen === "skills"       && <SkillTracker profile={profile} skillProgress={skillProgress} setSkillProgress={handleSetSkills} onXPGain={handleXPGain} onUpdateProfile={updateProfile} />}
+        {screen === "conditioning" && <Conditioning onXPGain={handleXPGain} profile={profile} onUpdateProfile={updateProfile} />}
+        {screen === "planner"      && <TrainingPlanner profile={profile} onUpdateProfile={updateProfile} />}
+        {screen === "progress"     && <ProgressScreen profile={profile} skillProgress={skillProgress} onNavigate={setScreen} onUpdateProfile={updateProfile} />}
+        {screen === "achievements" && <AchievementsScreen profile={profile} skillProgress={skillProgress} onUpdateProfile={updateProfile} />}
+        {screen === "videos"       && <VideoLibrary videos={videos} setVideos={setVideos} />}
+        {screen === "judge"        && <ScoreVision profile={profile} />}
+        {screen === "meets"        && <CompetitionCalendar profile={profile} />}
+        {screen === "settings"     && <SettingsScreen profile={profile} onUpdateProfile={updateProfile} onNavigate={setScreen} />}
+      </div>
+
+      {/* ── Bottom Nav ── */}
+      <div style={{ position: "sticky", bottom: 0, background: "var(--bg)", borderTop: "1px solid var(--border)", display: "flex", padding: "8px 0 12px" }}>
+        {NAV.map(n => {
+          const active = screen === n.id;
+          return (
+            <button key={n.id} onClick={() => setScreen(n.id)} style={{
+              flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 3,
+              background: "none", border: "none", cursor: "pointer", padding: "8px 0"
+            }}>
+              <div style={{ fontSize: 20, filter: active ? "none" : "grayscale(1) opacity(0.5)" }}>{t(n.icon)}</div>
+              <span style={{ fontSize: 10, color: active ? "var(--accent)" : "var(--muted-text)", fontWeight: active ? 700 : 400 }}>{n.label}</span>
+              {active && <div style={{ width: 4, height: 4, borderRadius: "50%", background: "var(--accent)" }} />}
+            </button>
+          );
+        })}
+      </div>
+    </>
+  );
+}
 
 // Mount
 const _root = document.getElementById("root");
