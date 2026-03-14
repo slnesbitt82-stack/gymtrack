@@ -274,19 +274,25 @@ function checkBadges(stats, earnedBadgeIds) {
 // ── HELPERS ──────────────────────────────────────────────────────────────────
 
 // In-memory fallback for when localStorage isn't available (Claude artifact sandbox)
-const _memStore = {};  // always-current in-memory mirror of localStorage
+// ── User namespace ────────────────────────────────────────────────────────────
+// All storage is prefixed with the active user ID so multiple gymnasts
+// can share a device with completely separate data.
+let _activeUserId = null;
+const getUserId  = ()  => _activeUserId;
+const setUserId  = (id) => { _activeUserId = id; };
+const userKey    = (key) => _activeUserId ? `u_${_activeUserId}_${key}` : key;
+
+// ── Storage layer ─────────────────────────────────────────────────────────────
+const _memStore = {};
 const _hasLS = (() => { try { localStorage.setItem('__t','1'); localStorage.removeItem('__t'); return true; } catch { return false; } })();
 
-// lsGet: prefer _memStore (always up-to-date even before deferred flush),
-// fall back to localStorage (for values written before this session), then null.
 const lsGet = (key) => {
-  if (key in _memStore) return _memStore[key];
-  if (_hasLS) { try { const v = localStorage.getItem(key); if (v !== null) { _memStore[key] = v; return v; } } catch {} }
+  const k = userKey(key);
+  if (k in _memStore) return _memStore[k];
+  if (_hasLS) { try { const v = localStorage.getItem(k); if (v !== null) { _memStore[k] = v; return v; } } catch {} }
   return null;
 };
 
-// lsSet: write to _memStore immediately (so lsGet always returns latest),
-// then flush to localStorage in a deferred task so it never blocks the UI (INP fix).
 const _lsPending = {};
 let _lsScheduled = false;
 const lsFlush = () => {
@@ -298,16 +304,36 @@ const lsFlush = () => {
   }
 };
 const lsSet = (key, val) => {
-  _memStore[key] = val;   // synchronous — always readable immediately
+  const k = userKey(key);
+  _memStore[k] = val;
   if (_hasLS) {
-    _lsPending[key] = val;
+    _lsPending[k] = val;
     if (!_lsScheduled) { _lsScheduled = true; setTimeout(lsFlush, 0); }
   }
 };
 const lsKeys = () => {
-  const keys = new Set(Object.keys(_memStore));
-  if (_hasLS) { try { for (let i = 0; i < localStorage.length; i++) keys.add(localStorage.key(i)); } catch {} }
+  const prefix = _activeUserId ? `u_${_activeUserId}_` : "";
+  const keys = new Set(Object.keys(_memStore).filter(k => k.startsWith(prefix)).map(k => k.slice(prefix.length)));
+  if (_hasLS) {
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith(prefix)) keys.add(k.slice(prefix.length));
+      }
+    } catch {}
+  }
   return Array.from(keys);
+};
+
+// Raw (un-namespaced) helpers for reading the user registry itself
+const lsGetRaw = (key) => {
+  if (key in _memStore) return _memStore[key];
+  if (_hasLS) { try { return localStorage.getItem(key); } catch {} }
+  return null;
+};
+const lsSetRaw = (key, val) => {
+  _memStore[key] = val;
+  if (_hasLS) { _lsPending[key] = val; if (!_lsScheduled) { _lsScheduled = true; setTimeout(lsFlush, 0); } }
 };
 
 function useStorage(key, initial) {
@@ -315,12 +341,10 @@ function useStorage(key, initial) {
     try { const s = lsGet(key); return s ? JSON.parse(s) : initial; } catch { return initial; }
   });
   const save = useCallback((v) => {
-    // Write to in-memory store synchronously so it survives navigation/unmount,
-    // then flush to localStorage in a deferred task to avoid blocking the UI (INP fix).
     const serialised = JSON.stringify(v);
-    _memStore[key] = serialised;          // immediately readable by any component
+    _memStore[userKey(key)] = serialised;
     setVal(v);
-    lsSet(key, serialised);               // batched deferred write to disk
+    lsSet(key, serialised);
   }, [key]);
   return [val, save];
 }
@@ -2218,10 +2242,8 @@ function ExerciseTimer({ item, onClose, onComplete }) {
   );
 }
 
-function Conditioning({ onXPGain, profile, onUpdateProfile }) {
-  const [checked, setChecked] = useStorage("conditioning_" + new Date().toDateString(), []);
-  const [customStretches, setCustomStretches] = useStorage("custom_stretches", STRETCHES);
-  const [customConditioning, setCustomConditioning] = useStorage("custom_conditioning", CONDITIONING);
+function Conditioning({ onXPGain, profile, onUpdateProfile, checked, setChecked, customStretches, setCustomStretches, customConditioning, setCustomConditioning, plan }) {
+  // checked, customStretches, customConditioning are lifted to App for cross-screen sharing
   const [showCelebration, setShowCelebration] = useState(false);
   const [confetti, setConfetti] = useState(false);
   const [tab, setTab] = useState("stretching");
@@ -2257,7 +2279,9 @@ function Conditioning({ onXPGain, profile, onUpdateProfile }) {
       fireToast(XP_VALUES.EXERCISE_DONE, "Exercise done");
       onXPGain && onXPGain(XP_VALUES.EXERCISE_DONE);
     }
-    if (next.length === total && !showCelebration) {
+    const celebTarget = hasplan ? plannedTotal : total;
+    const celebDone = hasplan ? plannedIds.filter(id => next.includes(id)).length : next.length;
+    if (celebDone === celebTarget && celebTarget > 0 && !showCelebration) {
       setTimeout(() => { setShowCelebration(true); setConfetti(true); }, 200);
       setTimeout(() => setConfetti(false), 3000);
       fireToast(XP_VALUES.DAILY_COMPLETE, "Full day complete! 🔥");
@@ -2312,7 +2336,16 @@ function Conditioning({ onXPGain, profile, onUpdateProfile }) {
     setDeleteConfirm(null);
   };
 
-  const pct = Math.round((checked.length / total) * 100);
+  // If today has a plan, progress is based on planned items only
+  const todayDayIdx = (() => { const d = new Date().getDay(); return d === 0 ? 6 : d - 1; })();
+  const todayPlanned = ((plan || {})[todayDayIdx] || []).filter(e => e.type === "stretch" || e.type === "conditioning");
+  const hasplan = todayPlanned.length > 0;
+  // planned item ids (condId or id)
+  const plannedIds = todayPlanned.map(e => e.condId || e.id);
+  const plannedTotal = hasplan ? todayPlanned.length : total;
+  const plannedDone  = hasplan ? plannedIds.filter(id => checked.includes(id)).length : checked.length;
+  const pct = Math.round((plannedDone / plannedTotal) * 100);
+  const planAllDone = plannedDone === plannedTotal && plannedTotal > 0;
 
   return (
     <div style={{ padding: "24px 20px", maxWidth: 480, margin: "0 auto" }}>
@@ -2445,19 +2478,69 @@ function Conditioning({ onXPGain, profile, onUpdateProfile }) {
           <ScreenIconButton screenKey="conditioning" defaultIcon="💪" profile={profile} onUpdateProfile={onUpdateProfile} />
         )}
       </div>
-      <p style={{ color: "var(--muted-text)", fontSize: 13, marginBottom: 20 }}>{new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })}</p>
+      <p style={{ color: "var(--muted-text)", fontSize: 13, marginBottom: 16 }}>{new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })}</p>
+
+      {/* ── Today's Planned Exercises (from Plan screen) ── */}
+      {(() => {
+        const todayPlan = (() => {
+          try {
+            const todayIdx = (() => { const d = new Date().getDay(); return d === 0 ? 6 : d - 1; })();
+            return ((plan || {})[todayIdx] || []).filter(e => e.type === "stretch" || e.type === "conditioning");
+          } catch (_) { return []; }
+        })();
+        if (todayPlan.length === 0) return null;
+        const donePlan = todayPlan.filter(e => checked.includes(e.condId || e.id)).length;
+        return (
+          <div style={{ background: "var(--card)", borderRadius: 16, padding: "14px 16px", marginBottom: 16, border: "1.5px solid var(--accent)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+              <p style={{ color: "var(--accent)", fontFamily: "var(--font-display)", fontSize: 14, fontWeight: 700 }}>📅 Today's Plan</p>
+              <span style={{ color: donePlan === todayPlan.length ? "#5dc8a0" : "var(--accent)", fontSize: 12, fontWeight: 700 }}>{donePlan}/{todayPlan.length} done</span>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {todayPlan.map(entry => {
+                const condId = entry.condId || entry.id;
+                const done   = checked.includes(condId);
+                const col    = entry.type === "stretch" ? "#7ecef5" : "#5dc8a0";
+                const allItems = entry.type === "stretch" ? stretches : conditioning;
+                const item = allItems.find(i => i.id === condId) || { icon: entry.type === "stretch" ? "🧘" : "💪", name: entry.name, sets: entry.sets };
+                return (
+                  <div key={entry.id} onClick={() => toggle(condId)}
+                    style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 12px", borderRadius: 10, background: done ? col + "18" : "var(--input-bg)", border: `1.5px solid ${done ? col + "88" : col + "44"}`, cursor: "pointer", transition: "all .2s" }}>
+                    <div style={{ width: 22, height: 22, borderRadius: 6, border: `2px solid ${done ? col : "var(--border)"}`, background: done ? col : "transparent", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, color: "#fff", flexShrink: 0, transition: "all .2s" }}>{done ? "✓" : ""}</div>
+                    <span style={{ fontSize: 18 }}>{t(item.icon)}</span>
+                    <div style={{ flex: 1 }}>
+                      <p style={{ color: done ? col : "var(--text)", fontSize: 13, fontWeight: 600, textDecoration: done ? "line-through" : "none" }}>{item.name}</p>
+                      {item.sets && <p style={{ color: "var(--muted-text)", fontSize: 11 }}>{item.sets}</p>}
+                    </div>
+                    <span style={{ fontSize: 9, background: col + "33", color: col, borderRadius: 8, padding: "2px 7px", fontWeight: 700 }}>{entry.type}</span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })()}
 
 
 
       {/* Overall progress */}
       <div style={{ background: "var(--card)", borderRadius: 16, padding: "16px 20px", marginBottom: 20 }}>
         <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
-          <span style={{ color: "var(--text)", fontSize: 14, fontWeight: 600 }}>Daily Progress</span>
-          <span style={{ color: allDone ? "#5dc8a0" : "var(--accent)", fontSize: 14, fontWeight: 700 }}>{checked.length}/{total} {allDone && "✓ Complete!"}</span>
+          <span style={{ color: "var(--text)", fontSize: 14, fontWeight: 600 }}>
+            Daily Progress{hasplan ? " (Today's Plan)" : ""}
+          </span>
+          <span style={{ color: planAllDone ? "#5dc8a0" : "var(--accent)", fontSize: 14, fontWeight: 700 }}>
+            {plannedDone}/{plannedTotal} {planAllDone && "✓ Complete!"}
+          </span>
         </div>
         <div style={{ height: 10, background: "var(--input-bg)", borderRadius: 5, overflow: "hidden" }}>
-          <div style={{ height: "100%", width: `${pct}%`, background: allDone ? "#5dc8a0" : "var(--accent)", borderRadius: 5, transition: "width .5s ease" }} />
+          <div style={{ height: "100%", width: `${pct}%`, background: planAllDone ? "#5dc8a0" : "var(--accent)", borderRadius: 5, transition: "width .5s ease" }} />
         </div>
+        {hasplan && (
+          <p style={{ color: "var(--muted-text)", fontSize: 10, marginTop: 6 }}>
+            Based on your planned exercises · All {total} exercises shown below
+          </p>
+        )}
       </div>
 
       {/* Tabs */}
@@ -4948,15 +5031,13 @@ const DAY_FULL = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Satur
 const EVENT_COLORS = { Vault: "#e07b54", Bars: "#7ecef5", Beam: "#e6b740", Floor: "#5dc8a0" };
 const EVENT_ICONS = { Vault: "🤸", Bars: "🏹", Beam: "⚖️", Floor: "🌟" };
 
-function TrainingPlanner({ profile, onUpdateProfile }) {
-  // plan entries: { [dayIndex]: [{ id, type, name, event, note, sets, duration }] }
-  // type: "skill" | "stretch" | "conditioning"
-  const [plan, setPlan]           = useStorage("training_plan", {});
+function TrainingPlanner({ profile, onUpdateProfile, checked, setChecked, customStretches, customConditioning, plan, setPlan }) {
+  // plan/setPlan lifted to App for cross-screen sharing with Conditioning
   const [completed, setCompleted] = useStorage("training_completed", {});
-  const [reminders, setReminders] = useStorage("training_reminders", []); // [{id, day, time, label}]
+  const [reminders, setReminders] = useStorage("training_reminders", []);
+  const [xpEarned, setXpEarned]   = useStorage("planner_xp_dates", {});
 
   const [viewMode, setViewMode]   = useState("week");
-  const [activeTab, setActiveTab] = useState("skill"); // "skill" | "stretch" | "conditioning"
   const [selectedDay, setSelectedDay] = useState(() => {
     const d = new Date().getDay(); return d === 0 ? 6 : d - 1;
   });
@@ -4968,59 +5049,75 @@ function TrainingPlanner({ profile, onUpdateProfile }) {
   const [reminderDraft, setReminderDraft] = useState({ day: 0, time: "09:00", label: "Time to train! 💪" });
   const [toast, setToast]          = useState(null);
   const [activeTimer, setActiveTimer] = useState(null);
-
-  // XP for planner completion
-  const [xpEarned, setXpEarned]   = useStorage("planner_xp_dates", {});
-
-  // Add form state
-  const [addType, setAddType]     = useState("skill");
-  const [addEvent, setAddEvent]   = useState("Floor");
-  const [addName, setAddName]     = useState("");
-  const [addNote, setAddNote]     = useState("");
-  const [addSets, setAddSets]     = useState("");
+  const [addType, setAddType]      = useState("skill");
+  const [addEvent, setAddEvent]    = useState("Floor");
+  const [addName, setAddName]      = useState("");
+  const [addNote, setAddNote]      = useState("");
+  const [addSets, setAddSets]      = useState("");
   const [skillSearch, setSkillSearch] = useState("");
+  const [pickModal, setPickModal]  = useState(null); // "stretch" | "conditioning" — pick from list modal
 
   const showToast = (msg, xp) => { setToast({ msg, xp }); setTimeout(() => setToast(null), 2400); };
 
   // ── Week helpers ──────────────────────────────────────────────────────────
   const getWeekDates = (offset = 0) => {
     const today = new Date();
-    const dow   = today.getDay();
+    const dow = today.getDay();
     const monday = new Date(today);
     monday.setDate(today.getDate() - (dow === 0 ? 6 : dow - 1) + offset * 7);
     monday.setHours(0, 0, 0, 0);
     return Array.from({ length: 7 }, (_, i) => { const d = new Date(monday); d.setDate(monday.getDate() + i); return d; });
   };
 
-  const weekDates  = getWeekDates(weekOffset);
-  const weekKey    = weekDates[0].toISOString().slice(0, 10);
-  const todayStr   = new Date().toDateString();
+  const weekDates = getWeekDates(weekOffset);
+  const weekKey   = weekDates[0].toISOString().slice(0, 10);
+  const todayStr  = new Date().toDateString();
+  const todayDayIdx = (() => { const d = new Date().getDay(); return d === 0 ? 6 : d - 1; })();
+  const isThisWeek = weekOffset === 0;
 
   const getCompletedKey = (dayIdx, entryId) => `${weekKey}_${dayIdx}_${entryId}`;
   const isDone    = (dayIdx, entryId) => !!completed[getCompletedKey(dayIdx, entryId)];
   const dayEntries = (dayIdx) => plan[dayIdx] || [];
 
-  const toggleComplete = (dayIdx, entryId) => {
-    const key  = getCompletedKey(dayIdx, entryId);
-    const done = !completed[key];
-    setCompleted(prev => ({ ...prev, [key]: done }));
+  // For stretch/conditioning entries, completion is tracked via conditioning_<date> (shared with Train screen)
+  const isCondDone = (entry) => {
+    if (entry.type === "stretch" || entry.type === "conditioning") {
+      return checked && checked.includes(entry.condId || entry.id);
+    }
+    return isDone(selectedDay, entry.id);
+  };
 
-    // XP gamification — award for completing a day's plan
-    if (done) {
-      const entries = dayEntries(dayIdx);
-      const nowDone = entries.filter(e => e.id === entryId ? true : isDone(dayIdx, e.id)).length;
-      const todayKey2 = `${weekKey}_${dayIdx}`;
-      if (nowDone === entries.length && entries.length > 0 && !xpEarned[todayKey2]) {
-        setXpEarned(prev => ({ ...prev, [todayKey2]: true }));
-        showToast("Day complete! 🔥", 50);
+  const toggleEntry = (dayIdx, entry) => {
+    if (entry.type === "stretch" || entry.type === "conditioning") {
+      const condId = entry.condId || entry.id;
+      if (!checked) return;
+      const wasChecked = checked.includes(condId);
+      setChecked(wasChecked ? checked.filter(c => c !== condId) : [...checked, condId]);
+    } else {
+      const key = getCompletedKey(dayIdx, entry.id);
+      setCompleted(prev => ({ ...prev, [key]: !prev[key] }));
+      // XP for completing a full day
+      if (!completed[key]) {
+        const entries = dayEntries(dayIdx);
+        const nowDone = entries.filter(e => e.id === entry.id ? true : isEntryDoneForDay(dayIdx, e)).length;
+        const todayKey2 = `${weekKey}_${dayIdx}`;
+        if (nowDone === entries.length && entries.length > 0 && !xpEarned[todayKey2]) {
+          setXpEarned(prev => ({ ...prev, [todayKey2]: true }));
+          showToast("Day complete! 🔥", 50);
+        }
       }
     }
   };
 
-  // ── Planner entries ───────────────────────────────────────────────────────
+  const isEntryDoneForDay = (dayIdx, entry) => {
+    if (entry.type === "stretch" || entry.type === "conditioning") return checked && checked.includes(entry.condId || entry.id);
+    return isDone(dayIdx, entry.id);
+  };
+
+  // ── Plan CRUD ─────────────────────────────────────────────────────────────
   const openAdd = (dayIdx, defaultType = "skill") => {
     setEditEntry(null);
-    setAddType(defaultType); setActiveTab(defaultType);
+    setAddType(defaultType);
     setAddEvent("Floor"); setAddName(""); setAddNote(""); setAddSets(""); setSkillSearch("");
     setSelectedDay(dayIdx);
     setShowAddModal(true);
@@ -5028,8 +5125,9 @@ function TrainingPlanner({ profile, onUpdateProfile }) {
 
   const openEdit = (dayIdx, entry) => {
     setSelectedDay(dayIdx);
-    setAddType(entry.type || "skill"); setActiveTab(entry.type || "skill");
-    setAddEvent(entry.event || "Floor"); setAddName(entry.name || entry.skill || "");
+    setAddType(entry.type || "skill");
+    setAddEvent(entry.event || "Floor");
+    setAddName(entry.name || "");
     setAddNote(entry.note || ""); setAddSets(entry.sets || ""); setSkillSearch("");
     setEditEntry({ dayIdx, entry });
     setShowAddModal(true);
@@ -5039,12 +5137,12 @@ function TrainingPlanner({ profile, onUpdateProfile }) {
     const name = addName.trim();
     if (!name) return;
     const newEntry = {
-      id:    editEntry ? editEntry.entry.id : `${selectedDay}_${Date.now()}`,
-      type:  addType,
+      id:     editEntry ? editEntry.entry.id : `${selectedDay}_${Date.now()}`,
+      type:   addType,
       name,
-      event: addType === "skill" ? addEvent : undefined,
-      note:  addNote.trim(),
-      sets:  addSets.trim(),
+      event:  addType === "skill" ? addEvent : undefined,
+      note:   addNote.trim(),
+      sets:   addSets.trim(),
     };
     if (editEntry) {
       setPlan(prev => ({ ...prev, [editEntry.dayIdx]: (prev[editEntry.dayIdx] || []).map(e => e.id === editEntry.entry.id ? newEntry : e) }));
@@ -5052,6 +5150,22 @@ function TrainingPlanner({ profile, onUpdateProfile }) {
       setPlan(prev => ({ ...prev, [selectedDay]: [...(prev[selectedDay] || []), newEntry] }));
     }
     setShowAddModal(false); setEditEntry(null);
+  };
+
+  // Add stretch/conditioning from the shared list directly into the plan for a day
+  const addFromList = (dayIdx, item, type) => {
+    // Don't add duplicates
+    const existing = dayEntries(dayIdx);
+    if (existing.find(e => e.condId === item.id || (e.name === item.name && e.type === type))) return;
+    const newEntry = {
+      id:     `${dayIdx}_${Date.now()}`,
+      type,
+      name:   item.name,
+      sets:   item.sets,
+      condId: item.id,   // links to conditioning_<date> for completion tracking
+      note:   "",
+    };
+    setPlan(prev => ({ ...prev, [dayIdx]: [...(prev[dayIdx] || []), newEntry] }));
   };
 
   const deleteEntry = (dayIdx, entryId) => {
@@ -5067,7 +5181,7 @@ function TrainingPlanner({ profile, onUpdateProfile }) {
     showToast(`Copied to ${DAY_FULL[next]}!`, 0);
   };
 
-  // ── Reminders (Web Notifications) ────────────────────────────────────────
+  // ── Reminders ─────────────────────────────────────────────────────────────
   const requestNotifPermission = async () => {
     if (!("Notification" in window)) return false;
     if (Notification.permission === "granted") return true;
@@ -5077,67 +5191,37 @@ function TrainingPlanner({ profile, onUpdateProfile }) {
 
   const saveReminder = async () => {
     const granted = await requestNotifPermission();
-    if (!granted) { showToast("Enable notifications in browser settings", 0); return; }
+    if (!granted) { showToast("Enable notifications in browser settings", 0); setShowReminder(false); return; }
     const id = Date.now().toString();
-    const newR = { id, ...reminderDraft };
-    setReminders(prev => [...prev, newR]);
-    scheduleReminder(newR);
+    setReminders(prev => [...prev, { id, ...reminderDraft }]);
     setShowReminder(false);
     showToast("Reminder set! 🔔", 0);
   };
 
-  const scheduleReminder = (r) => {
-    // Calculate ms until next occurrence of this day+time
-    const [h, m] = r.time.split(":").map(Number);
-    const now   = new Date();
-    const target = new Date();
-    target.setHours(h, m, 0, 0);
-    // Day of week: r.day 0=Mon→1, ... 6=Sun→0
-    const targetDow = r.day === 6 ? 0 : r.day + 1;
-    const diff = ((targetDow - now.getDay() + 7) % 7) * 86400000 + (target - now);
-    const wait = diff <= 0 ? diff + 7 * 86400000 : diff;
-    setTimeout(() => {
-      if (Notification.permission === "granted") {
-        new Notification("GymTrack 🤸", { body: r.label, icon: "/icon-192.png" });
-      }
-    }, wait);
-  };
-
   const deleteReminder = (id) => setReminders(prev => prev.filter(r => r.id !== id));
 
-  // ── Gamification stats ────────────────────────────────────────────────────
+  // ── Stats ─────────────────────────────────────────────────────────────────
   const totalScheduled = DAYS.reduce((acc, _, i) => acc + dayEntries(i).length, 0);
-  const totalDone      = DAYS.reduce((acc, _, i) => acc + dayEntries(i).filter(e => isDone(i, e.id)).length, 0);
-  const weekPct        = totalScheduled > 0 ? Math.round((totalDone / totalScheduled) * 100) : 0;
-  const streakDays     = (() => {
-    let streak = 0;
-    for (let i = selectedDay; i >= 0; i--) {
-      const entries = dayEntries(i);
-      if (entries.length === 0) break;
-      const allDone = entries.every(e => isDone(i, e.id));
-      if (allDone) streak++; else break;
-    }
-    return streak;
-  })();
+  const totalDone      = isThisWeek
+    ? DAYS.reduce((acc, _, i) => acc + dayEntries(i).filter(e => isEntryDoneForDay(i, e)).length, 0)
+    : DAYS.reduce((acc, _, i) => acc + dayEntries(i).filter(e => isDone(i, e.id)).length, 0);
+  const weekPct = totalScheduled > 0 ? Math.round((totalDone / totalScheduled) * 100) : 0;
 
-  // Skills from level for autocomplete
+  // Level skills for autocomplete
   const levelSkills = SKILLS_BY_LEVEL[profile.level] || {};
   const allSkillsFlat = Object.entries(levelSkills).flatMap(([ev, skills]) => skills.map(s => ({ skill: s, event: ev })));
   const filteredSkills = skillSearch.trim()
     ? allSkillsFlat.filter(s => s.skill.toLowerCase().includes(skillSearch.toLowerCase()))
     : (levelSkills[addEvent] || []).map(s => ({ skill: s, event: addEvent }));
 
-  const DEFAULT_STRETCHES_NAMES = STRETCHES.map(s => s.name);
-  const DEFAULT_CONDITIONING_NAMES = CONDITIONING.map(s => s.name);
+  const stretches    = customStretches || STRETCHES;
+  const conditioning = customConditioning || CONDITIONING;
 
-  // Entry type config
-  const TYPE_CONFIG = {
-    skill:        { label: "Skill",        icon: EVENT_ICONS[addEvent] || "🎯", col: "var(--accent)" },
-    stretch:      { label: "Stretch",      icon: "🧘", col: "#7ecef5" },
-    conditioning: { label: "Conditioning", icon: "💪", col: "#5dc8a0" },
-  };
   const ENTRY_COLORS = { skill: "var(--accent)", stretch: "#7ecef5", conditioning: "#5dc8a0" };
   const ENTRY_ICONS  = { skill: "🎯", stretch: "🧘", conditioning: "💪" };
+
+  const entryColor = (e) => ENTRY_COLORS[e.type || "skill"] || "var(--accent)";
+  const entryIcon  = (e) => e.type === "stretch" ? "🧘" : e.type === "conditioning" ? "💪" : (EVENT_ICONS[e.event] || "🎯");
 
   return (
     <div style={{ padding: "0 0 40px", maxWidth: 480, margin: "0 auto" }}>
@@ -5150,13 +5234,51 @@ function TrainingPlanner({ profile, onUpdateProfile }) {
         </div>
       )}
 
-      {/* Exercise Timer overlay */}
+      {/* Timer overlay */}
       {activeTimer && (
         <ExerciseTimer
-          item={{ name: activeTimer.name, sets: activeTimer.sets || "30s", icon: ENTRY_ICONS[activeTimer.type] || "⏱️" }}
+          item={{ name: activeTimer.name, sets: activeTimer.sets || "30s", icon: entryIcon(activeTimer) }}
           onClose={() => setActiveTimer(null)}
-          onComplete={() => { toggleComplete(selectedDay, activeTimer.id); setActiveTimer(null); }}
+          onComplete={() => { toggleEntry(selectedDay, activeTimer); setActiveTimer(null); }}
         />
+      )}
+
+      {/* ── Pick from list modal (stretch / conditioning) ── */}
+      {pickModal && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.85)", display: "flex", alignItems: "flex-end", justifyContent: "center", zIndex: 3000 }}>
+          <div style={{ background: "var(--card)", borderRadius: "24px 24px 0 0", padding: "28px 22px 44px", width: "100%", maxWidth: 480, maxHeight: "85vh", overflowY: "auto", boxShadow: "0 -8px 40px rgba(0,0,0,0.6)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18 }}>
+              <h3 style={{ fontFamily: "var(--font-display)", color: "var(--text)", fontSize: 20 }}>
+                {pickModal.type === "stretch" ? "🧘 Add Stretch" : "💪 Add Conditioning"}
+              </h3>
+              <button onClick={() => setPickModal(null)} style={{ background: "var(--input-bg)", border: "none", borderRadius: 8, color: "var(--muted-text)", width: 34, height: 34, cursor: "pointer", fontSize: 20 }}>×</button>
+            </div>
+            <p style={{ color: "var(--muted-text)", fontSize: 12, marginBottom: 14 }}>
+              Tap any item to add it to {DAY_FULL[pickModal.dayIdx]}'s plan. Items already in the plan are shown with ✓.
+            </p>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {(pickModal.type === "stretch" ? stretches : conditioning).map(item => {
+                const alreadyIn = dayEntries(pickModal.dayIdx).some(e => e.condId === item.id || (e.name === item.name && e.type === pickModal.type));
+                const isDoneToday = checked && checked.includes(item.id);
+                const col = pickModal.type === "stretch" ? "#7ecef5" : "#5dc8a0";
+                return (
+                  <button key={item.id} onClick={() => { if (!alreadyIn) addFromList(pickModal.dayIdx, item, pickModal.type); }}
+                    style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 16px", borderRadius: 14, border: `2px solid ${alreadyIn ? col + "88" : "var(--border)"}`, background: alreadyIn ? col + "11" : "var(--input-bg)", cursor: alreadyIn ? "default" : "pointer", textAlign: "left", transition: "all .2s" }}>
+                    <span style={{ fontSize: 22, flexShrink: 0 }}>{t(item.icon)}</span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <p style={{ color: "var(--text)", fontSize: 14, fontWeight: 600, marginBottom: 1 }}>{item.name}</p>
+                      <p style={{ color: "var(--muted-text)", fontSize: 11 }}>{item.sets}</p>
+                    </div>
+                    <div style={{ flexShrink: 0, display: "flex", gap: 6, alignItems: "center" }}>
+                      {isDoneToday && <span style={{ fontSize: 11, color: col, fontWeight: 700, background: col + "22", borderRadius: 20, padding: "2px 8px" }}>Done ✓</span>}
+                      {alreadyIn ? <span style={{ fontSize: 18, color: col }}>✓</span> : <span style={{ fontSize: 18, color: "var(--muted-text)" }}>+</span>}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
       )}
 
       {/* ── Add/Edit Modal ── */}
@@ -5175,7 +5297,7 @@ function TrainingPlanner({ profile, onUpdateProfile }) {
               {[["skill","🎯 Skill"],["stretch","🧘 Stretch"],["conditioning","💪 Conditioning"]].map(([type, label]) => {
                 const col = ENTRY_COLORS[type];
                 return (
-                  <button key={type} onClick={() => { setAddType(type); setActiveTab(type); setAddName(""); setSkillSearch(""); }}
+                  <button key={type} onClick={() => { setAddType(type); setAddName(""); setSkillSearch(""); }}
                     style={{ flex: 1, padding: "9px 4px", borderRadius: 10, border: `2px solid ${addType === type ? col : "var(--border)"}`, background: addType === type ? col + "22" : "var(--input-bg)", color: addType === type ? col : "var(--muted-text)", cursor: "pointer", fontSize: 11, fontWeight: addType === type ? 700 : 400, transition: "all .15s", textAlign: "center" }}>
                     {label}
                   </button>
@@ -5183,7 +5305,7 @@ function TrainingPlanner({ profile, onUpdateProfile }) {
               })}
             </div>
 
-            {/* SKILL: event + skill picker */}
+            {/* SKILL */}
             {addType === "skill" && (
               <>
                 <p style={{ color: "var(--muted-text)", fontSize: 11, marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.8 }}>Event</p>
@@ -5197,10 +5319,10 @@ function TrainingPlanner({ profile, onUpdateProfile }) {
                 </div>
                 <input value={skillSearch} onChange={e => setSkillSearch(e.target.value)} placeholder="Search skills or type custom…"
                   style={{ width: "100%", padding: "11px 13px", borderRadius: 10, border: "1px solid var(--border)", background: "var(--input-bg)", color: "var(--text)", fontSize: 14, marginBottom: 8, boxSizing: "border-box" }} />
-                <div style={{ maxHeight: 170, overflowY: "auto", display: "flex", flexDirection: "column", gap: 5, marginBottom: 14 }}>
+                <div style={{ maxHeight: 160, overflowY: "auto", display: "flex", flexDirection: "column", gap: 5, marginBottom: 14 }}>
                   {filteredSkills.map(({ skill, event: ev }) => (
                     <button key={skill} onClick={() => { setAddName(skill); setAddEvent(ev); }}
-                      style={{ padding: "10px 13px", borderRadius: 10, textAlign: "left", border: `2px solid ${addName === skill ? EVENT_COLORS[ev] : "var(--border)"}`, background: addName === skill ? EVENT_COLORS[ev] + "22" : "var(--input-bg)", color: addName === skill ? EVENT_COLORS[ev] : "var(--text)", cursor: "pointer", fontSize: 13, fontWeight: addName === skill ? 700 : 400, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      style={{ padding: "10px 13px", borderRadius: 10, textAlign: "left", border: `2px solid ${addName === skill ? EVENT_COLORS[ev] : "var(--border)"}`, background: addName === skill ? EVENT_COLORS[ev] + "22" : "var(--input-bg)", color: addName === skill ? EVENT_COLORS[ev] : "var(--text)", cursor: "pointer", fontSize: 13, fontWeight: addName === skill ? 700 : 400, display: "flex", justifyContent: "space-between" }}>
                       <span>{skill}</span>
                       {skillSearch && ev !== addEvent && <span style={{ fontSize: 10, background: EVENT_COLORS[ev] + "33", color: EVENT_COLORS[ev], borderRadius: 8, padding: "2px 7px" }}>{ev}</span>}
                     </button>
@@ -5212,13 +5334,18 @@ function TrainingPlanner({ profile, onUpdateProfile }) {
               </>
             )}
 
-            {/* STRETCH: pick from list or custom */}
+            {/* STRETCH — pick from list */}
             {addType === "stretch" && (
               <>
                 <p style={{ color: "var(--muted-text)", fontSize: 11, marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.8 }}>Choose Stretch</p>
-                <div style={{ maxHeight: 180, overflowY: "auto", display: "flex", flexDirection: "column", gap: 5, marginBottom: 14 }}>
-                  {DEFAULT_STRETCHES_NAMES.map(s => (
-                    <button key={s} onClick={() => setAddName(s)} style={{ padding: "9px 13px", borderRadius: 10, textAlign: "left", border: `2px solid ${addName === s ? "#7ecef5" : "var(--border)"}`, background: addName === s ? "#7ecef522" : "var(--input-bg)", color: addName === s ? "#7ecef5" : "var(--text)", cursor: "pointer", fontSize: 13, fontWeight: addName === s ? 700 : 400 }}>{s}</button>
+                <div style={{ maxHeight: 200, overflowY: "auto", display: "flex", flexDirection: "column", gap: 5, marginBottom: 14 }}>
+                  {stretches.map(item => (
+                    <button key={item.id} onClick={() => { setAddName(item.name); setAddSets(item.sets); }}
+                      style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 13px", borderRadius: 10, textAlign: "left", border: `2px solid ${addName === item.name ? "#7ecef5" : "var(--border)"}`, background: addName === item.name ? "#7ecef522" : "var(--input-bg)", color: "var(--text)", cursor: "pointer", fontSize: 13, fontWeight: addName === item.name ? 700 : 400 }}>
+                      <span style={{ fontSize: 18 }}>{t(item.icon)}</span>
+                      <span style={{ flex: 1 }}>{item.name}</span>
+                      <span style={{ color: "var(--muted-text)", fontSize: 11 }}>{item.sets}</span>
+                    </button>
                   ))}
                 </div>
                 <input value={addName} onChange={e => setAddName(e.target.value)} placeholder="Or type custom stretch…"
@@ -5226,13 +5353,18 @@ function TrainingPlanner({ profile, onUpdateProfile }) {
               </>
             )}
 
-            {/* CONDITIONING: pick from list or custom */}
+            {/* CONDITIONING — pick from list */}
             {addType === "conditioning" && (
               <>
                 <p style={{ color: "var(--muted-text)", fontSize: 11, marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.8 }}>Choose Exercise</p>
-                <div style={{ maxHeight: 180, overflowY: "auto", display: "flex", flexDirection: "column", gap: 5, marginBottom: 14 }}>
-                  {DEFAULT_CONDITIONING_NAMES.map(s => (
-                    <button key={s} onClick={() => setAddName(s)} style={{ padding: "9px 13px", borderRadius: 10, textAlign: "left", border: `2px solid ${addName === s ? "#5dc8a0" : "var(--border)"}`, background: addName === s ? "#5dc8a022" : "var(--input-bg)", color: addName === s ? "#5dc8a0" : "var(--text)", cursor: "pointer", fontSize: 13, fontWeight: addName === s ? 700 : 400 }}>{s}</button>
+                <div style={{ maxHeight: 200, overflowY: "auto", display: "flex", flexDirection: "column", gap: 5, marginBottom: 14 }}>
+                  {conditioning.map(item => (
+                    <button key={item.id} onClick={() => { setAddName(item.name); setAddSets(item.sets); }}
+                      style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 13px", borderRadius: 10, textAlign: "left", border: `2px solid ${addName === item.name ? "#5dc8a0" : "var(--border)"}`, background: addName === item.name ? "#5dc8a022" : "var(--input-bg)", color: "var(--text)", cursor: "pointer", fontSize: 13, fontWeight: addName === item.name ? 700 : 400 }}>
+                      <span style={{ fontSize: 18 }}>{t(item.icon)}</span>
+                      <span style={{ flex: 1 }}>{item.name}</span>
+                      <span style={{ color: "var(--muted-text)", fontSize: 11 }}>{item.sets}</span>
+                    </button>
                   ))}
                 </div>
                 <input value={addName} onChange={e => setAddName(e.target.value)} placeholder="Or type custom exercise…"
@@ -5240,7 +5372,6 @@ function TrainingPlanner({ profile, onUpdateProfile }) {
               </>
             )}
 
-            {/* Sets / Duration */}
             <p style={{ color: "var(--muted-text)", fontSize: 11, marginBottom: 6, textTransform: "uppercase", letterSpacing: 0.8 }}>
               {addType === "skill" ? "Reps / Focus" : "Sets / Duration"}
             </p>
@@ -5329,8 +5460,7 @@ function TrainingPlanner({ profile, onUpdateProfile }) {
             <p style={{ color: "var(--muted-text)", fontSize: 13 }}>{profile.name} · {profile.level}</p>
           </div>
           <div style={{ display: "flex", gap: 6 }}>
-            <button onClick={() => setShowReminder(true)}
-              style={{ padding: "7px 12px", borderRadius: 10, border: "1px solid var(--border)", background: "var(--card)", color: "var(--muted-text)", cursor: "pointer", fontSize: 13 }} title="Set training reminders">🔔</button>
+            <button onClick={() => setShowReminder(true)} style={{ padding: "7px 12px", borderRadius: 10, border: "1px solid var(--border)", background: "var(--card)", color: "var(--muted-text)", cursor: "pointer", fontSize: 13 }} title="Set training reminders">🔔</button>
             {["week","day"].map(m => (
               <button key={m} onClick={() => setViewMode(m)} style={{ padding: "7px 12px", borderRadius: 10, border: `1px solid ${viewMode === m ? "var(--accent)" : "var(--border)"}`, background: viewMode === m ? "var(--accent-dim)" : "var(--card)", color: viewMode === m ? "var(--accent)" : "var(--muted-text)", cursor: "pointer", fontSize: 12, fontWeight: viewMode === m ? 700 : 400 }}>{m === "week" ? "Week" : "Day"}</button>
             ))}
@@ -5349,25 +5479,14 @@ function TrainingPlanner({ profile, onUpdateProfile }) {
           <button onClick={() => setWeekOffset(w => w + 1)} style={{ width: 34, height: 34, borderRadius: 10, border: "1px solid var(--border)", background: "var(--card)", color: "var(--text)", cursor: "pointer", fontSize: 16 }}>›</button>
         </div>
 
-        {/* Gamification stats */}
+        {/* Weekly progress */}
         {totalScheduled > 0 && (
           <div style={{ background: "var(--card)", borderRadius: 14, padding: "12px 16px", marginBottom: 16, border: "1px solid var(--border)" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-              <div style={{ display: "flex", gap: 14 }}>
-                <div style={{ textAlign: "center" }}>
-                  <div style={{ color: "var(--accent)", fontFamily: "var(--font-display)", fontSize: 18, fontWeight: 700 }}>{weekPct}%</div>
-                  <div style={{ color: "var(--muted-text)", fontSize: 9 }}>Week Done</div>
-                </div>
-                <div style={{ textAlign: "center" }}>
-                  <div style={{ color: "#e6b740", fontFamily: "var(--font-display)", fontSize: 18, fontWeight: 700 }}>{streakDays}🔥</div>
-                  <div style={{ color: "var(--muted-text)", fontSize: 9 }}>Day Streak</div>
-                </div>
-                <div style={{ textAlign: "center" }}>
-                  <div style={{ color: "#5dc8a0", fontFamily: "var(--font-display)", fontSize: 18, fontWeight: 700 }}>{totalDone}/{totalScheduled}</div>
-                  <div style={{ color: "var(--muted-text)", fontSize: 9 }}>Completed</div>
-                </div>
-              </div>
-              {weekPct === 100 && <span style={{ fontSize: 24 }}>🏆</span>}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 7 }}>
+              <span style={{ color: "var(--text)", fontSize: 13, fontWeight: 600 }}>Week Progress</span>
+              <span style={{ color: weekPct === 100 ? "#5dc8a0" : "var(--accent)", fontSize: 13, fontWeight: 700 }}>
+                {totalDone}/{totalScheduled} {weekPct === 100 && "🏆"}
+              </span>
             </div>
             <div style={{ height: 8, background: "var(--input-bg)", borderRadius: 4, overflow: "hidden" }}>
               <div style={{ height: "100%", width: `${weekPct}%`, background: weekPct === 100 ? "#5dc8a0" : "var(--accent)", borderRadius: 4, transition: "width .5s ease" }} />
@@ -5386,14 +5505,12 @@ function TrainingPlanner({ profile, onUpdateProfile }) {
               const isToday    = date.toDateString() === todayStr;
               const isSelected = selectedDay === i;
               const entries    = dayEntries(i);
-              const allDone    = entries.length > 0 && entries.every(e => isDone(i, e.id));
+              const allDone    = entries.length > 0 && entries.every(e => isEntryDoneForDay(i, e));
               return (
                 <button key={d} onClick={() => setSelectedDay(i)} style={{ flex: "0 0 auto", width: 50, padding: "8px 4px", borderRadius: 12, border: `2px solid ${isSelected ? "var(--accent)" : isToday ? "var(--accent)55" : "var(--border)"}`, background: isSelected ? "var(--accent-dim)" : allDone ? "#5dc8a055" : "var(--card)", cursor: "pointer", textAlign: "center", transition: "all .15s" }}>
                   <div style={{ color: "var(--muted-text)", fontSize: 10, marginBottom: 4 }}>{d}</div>
                   <div style={{ color: isToday ? "var(--accent)" : "var(--text)", fontSize: 14, fontWeight: isToday ? 700 : 400 }}>{date.getDate()}</div>
-                  {entries.length > 0 && (
-                    <div style={{ width: 6, height: 6, borderRadius: "50%", background: allDone ? "#5dc8a0" : "var(--accent)", margin: "4px auto 0" }} />
-                  )}
+                  {entries.length > 0 && <div style={{ width: 6, height: 6, borderRadius: "50%", background: allDone ? "#5dc8a0" : "var(--accent)", margin: "4px auto 0" }} />}
                 </button>
               );
             })}
@@ -5408,13 +5525,14 @@ function TrainingPlanner({ profile, onUpdateProfile }) {
                   <span style={{ marginLeft: 8, fontSize: 11, color: "var(--accent)", background: "var(--accent-dim)", padding: "2px 8px", borderRadius: 10 }}>Today</span>
                 )}
               </h3>
-              <div style={{ display: "flex", gap: 6 }}>
+              <div style={{ display: "flex", gap: 5 }}>
                 {dayEntries(selectedDay).length > 0 && (
-                  <button onClick={() => copyDayForward(selectedDay)} style={{ padding: "7px 12px", borderRadius: 9, border: "1px solid var(--border)", background: "var(--card)", color: "var(--muted-text)", cursor: "pointer", fontSize: 11 }}>Copy →</button>
+                  <button onClick={() => copyDayForward(selectedDay)} style={{ padding: "6px 10px", borderRadius: 9, border: "1px solid var(--border)", background: "var(--card)", color: "var(--muted-text)", cursor: "pointer", fontSize: 11 }}>Copy →</button>
                 )}
-                <button onClick={() => openAdd(selectedDay, "skill")} style={{ padding: "7px 10px", borderRadius: 9, border: "none", background: "var(--accent)", color: "#fff", cursor: "pointer", fontSize: 12, fontWeight: 700 }}>🎯</button>
-                <button onClick={() => openAdd(selectedDay, "stretch")} style={{ padding: "7px 10px", borderRadius: 9, border: "none", background: "#7ecef5", color: "#0f0e17", cursor: "pointer", fontSize: 12, fontWeight: 700 }}>🧘</button>
-                <button onClick={() => openAdd(selectedDay, "conditioning")} style={{ padding: "7px 10px", borderRadius: 9, border: "none", background: "#5dc8a0", color: "#0f0e17", cursor: "pointer", fontSize: 12, fontWeight: 700 }}>💪</button>
+                {/* Quick-add buttons */}
+                <button onClick={() => openAdd(selectedDay, "skill")} style={{ padding: "6px 10px", borderRadius: 9, border: "none", background: "var(--accent)", color: "#fff", cursor: "pointer", fontSize: 12, fontWeight: 700 }} title="Add skill">🎯</button>
+                <button onClick={() => setPickModal({ type: "stretch", dayIdx: selectedDay })} style={{ padding: "6px 10px", borderRadius: 9, border: "none", background: "#7ecef5", color: "#0f0e17", cursor: "pointer", fontSize: 12, fontWeight: 700 }} title="Add stretch">🧘</button>
+                <button onClick={() => setPickModal({ type: "conditioning", dayIdx: selectedDay })} style={{ padding: "6px 10px", borderRadius: 9, border: "none", background: "#5dc8a0", color: "#0f0e17", cursor: "pointer", fontSize: 12, fontWeight: 700 }} title="Add conditioning">💪</button>
               </div>
             </div>
 
@@ -5422,24 +5540,29 @@ function TrainingPlanner({ profile, onUpdateProfile }) {
               <div style={{ textAlign: "center", padding: "36px 20px", background: "var(--card)", borderRadius: 16, border: "2px dashed var(--border)" }}>
                 <div style={{ fontSize: 36, marginBottom: 10 }}>📋</div>
                 <p style={{ color: "var(--text)", fontSize: 14, fontWeight: 600, marginBottom: 6 }}>No plan for {DAY_FULL[selectedDay]}</p>
-                <p style={{ color: "var(--muted-text)", fontSize: 12, marginBottom: 16 }}>Add skills, stretches, or conditioning</p>
+                <p style={{ color: "var(--muted-text)", fontSize: 12, marginBottom: 16 }}>Add skills, stretches, or conditioning exercises</p>
                 <div style={{ display: "flex", gap: 8, justifyContent: "center" }}>
-                  <button onClick={() => openAdd(selectedDay, "skill")} style={{ padding: "9px 16px", borderRadius: 10, border: "none", background: "var(--accent)", color: "#fff", cursor: "pointer", fontSize: 12, fontWeight: 700 }}>🎯 Skill</button>
-                  <button onClick={() => openAdd(selectedDay, "stretch")} style={{ padding: "9px 16px", borderRadius: 10, border: "none", background: "#7ecef5", color: "#0f0e17", cursor: "pointer", fontSize: 12, fontWeight: 700 }}>🧘 Stretch</button>
-                  <button onClick={() => openAdd(selectedDay, "conditioning")} style={{ padding: "9px 16px", borderRadius: 10, border: "none", background: "#5dc8a0", color: "#0f0e17", cursor: "pointer", fontSize: 12, fontWeight: 700 }}>💪 Conditioning</button>
+                  <button onClick={() => openAdd(selectedDay, "skill")} style={{ padding: "9px 14px", borderRadius: 10, border: "none", background: "var(--accent)", color: "#fff", cursor: "pointer", fontSize: 12, fontWeight: 700 }}>🎯 Skill</button>
+                  <button onClick={() => setPickModal({ type: "stretch", dayIdx: selectedDay })} style={{ padding: "9px 14px", borderRadius: 10, border: "none", background: "#7ecef5", color: "#0f0e17", cursor: "pointer", fontSize: 12, fontWeight: 700 }}>🧘 Stretch</button>
+                  <button onClick={() => setPickModal({ type: "conditioning", dayIdx: selectedDay })} style={{ padding: "9px 14px", borderRadius: 10, border: "none", background: "#5dc8a0", color: "#0f0e17", cursor: "pointer", fontSize: 12, fontWeight: 700 }}>💪 Conditioning</button>
                 </div>
               </div>
             ) : (
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                 {dayEntries(selectedDay).map(entry => {
-                  const done = isDone(selectedDay, entry.id);
-                  const col  = ENTRY_COLORS[entry.type || "skill"] || "var(--accent)";
-                  const icon = entry.type === "stretch" ? "🧘" : entry.type === "conditioning" ? "💪" : (EVENT_ICONS[entry.event] || "🎯");
+                  const done = isEntryDoneForDay(selectedDay, entry);
+                  const col  = entryColor(entry);
+                  const icon = entryIcon(entry);
                   const hasTimer = entry.sets && parseTimerSeconds(entry.sets);
+                  const isToday = weekDates[selectedDay].toDateString() === todayStr;
                   return (
                     <div key={entry.id} style={{ background: done ? col + "18" : "var(--card)", borderRadius: 14, border: `2px solid ${done ? col + "88" : col + "44"}`, padding: "12px 14px", transition: "all .2s" }}>
                       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                        <button onClick={() => toggleComplete(selectedDay, entry.id)} style={{ width: 30, height: 30, borderRadius: 8, flexShrink: 0, border: `2px solid ${done ? col : "var(--border)"}`, background: done ? col : "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, color: "#fff", transition: "all .2s" }}>{done ? "✓" : ""}</button>
+                        {/* Checkbox — only interactive for today or skill entries */}
+                        <button onClick={() => isToday || entry.type === "skill" ? toggleEntry(selectedDay, entry) : null}
+                          style={{ width: 30, height: 30, borderRadius: 8, flexShrink: 0, border: `2px solid ${done ? col : "var(--border)"}`, background: done ? col : "transparent", cursor: (isToday || entry.type === "skill") ? "pointer" : "default", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, color: "#fff", transition: "all .2s" }}>
+                          {done ? "✓" : ""}
+                        </button>
                         <div style={{ flex: 1, minWidth: 0 }}>
                           <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 1 }}>
                             <span style={{ fontSize: 13 }}>{icon}</span>
@@ -5447,15 +5570,18 @@ function TrainingPlanner({ profile, onUpdateProfile }) {
                             <span style={{ fontSize: 9, background: col + "33", color: col, borderRadius: 8, padding: "1px 6px", fontWeight: 700, textTransform: "capitalize" }}>{entry.type || "skill"}</span>
                           </div>
                           {(entry.sets || entry.note) && (
-                            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                            <div style={{ display: "flex", gap: 8 }}>
                               {entry.sets && <span style={{ color: "var(--muted-text)", fontSize: 11 }}>{entry.sets}</span>}
                               {entry.note && <span style={{ color: "var(--muted-text)", fontSize: 11, fontStyle: "italic" }}>{entry.note}</span>}
                             </div>
                           )}
+                          {!isToday && (entry.type === "stretch" || entry.type === "conditioning") && (
+                            <span style={{ fontSize: 10, color: "var(--muted-text)" }}>Tracked on Train screen</span>
+                          )}
                         </div>
                         <div style={{ display: "flex", gap: 4 }}>
-                          {hasTimer && !done && (
-                            <button onClick={() => setActiveTimer(entry)} style={{ width: 28, height: 28, borderRadius: 7, border: `1px solid ${col}44`, background: col + "22", color: col, cursor: "pointer", fontSize: 13, display: "flex", alignItems: "center", justifyContent: "center" }} title="Start timer">⏱</button>
+                          {hasTimer && isToday && (
+                            <button onClick={() => setActiveTimer(entry)} style={{ width: 28, height: 28, borderRadius: 7, border: `1px solid ${col}44`, background: col + "22", color: col, cursor: "pointer", fontSize: 13, display: "flex", alignItems: "center", justifyContent: "center" }}>⏱</button>
                           )}
                           <button onClick={() => openEdit(selectedDay, entry)} style={{ width: 28, height: 28, borderRadius: 7, border: "1px solid var(--border)", background: "var(--input-bg)", color: "var(--muted-text)", cursor: "pointer", fontSize: 13, display: "flex", alignItems: "center", justifyContent: "center" }}>✏️</button>
                           <button onClick={() => setDeleteTarget({ dayIdx: selectedDay, entry })} style={{ width: 28, height: 28, borderRadius: 7, border: "1px solid #e07b5444", background: "#e07b5411", color: "#e07b54", cursor: "pointer", fontSize: 13, display: "flex", alignItems: "center", justifyContent: "center" }}>🗑️</button>
@@ -5466,7 +5592,7 @@ function TrainingPlanner({ profile, onUpdateProfile }) {
                 })}
                 <div style={{ display: "flex", justifyContent: "flex-end", paddingTop: 2 }}>
                   <span style={{ color: "var(--muted-text)", fontSize: 12 }}>
-                    {dayEntries(selectedDay).filter(e => isDone(selectedDay, e.id)).length}/{dayEntries(selectedDay).length} done
+                    {dayEntries(selectedDay).filter(e => isEntryDoneForDay(selectedDay, e)).length}/{dayEntries(selectedDay).length} done
                   </span>
                 </div>
               </div>
@@ -5482,7 +5608,7 @@ function TrainingPlanner({ profile, onUpdateProfile }) {
             const date    = weekDates[i];
             const isToday = date.toDateString() === todayStr;
             const entries = dayEntries(i);
-            const doneCount = entries.filter(e => isDone(i, e.id)).length;
+            const doneCount = entries.filter(e => isEntryDoneForDay(i, e)).length;
             return (
               <div key={d} style={{ marginBottom: 12 }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 14px", background: isToday ? "var(--accent-dim)" : "var(--card)", borderRadius: entries.length > 0 ? "14px 14px 0 0" : 14, border: `1px solid ${isToday ? "var(--accent)55" : "var(--border)"}` }}>
@@ -5491,24 +5617,24 @@ function TrainingPlanner({ profile, onUpdateProfile }) {
                       <div style={{ color: "var(--muted-text)", fontSize: 10 }}>{d}</div>
                       <div style={{ color: isToday ? "var(--accent)" : "var(--text)", fontSize: 17, fontWeight: isToday ? 700 : 500 }}>{date.getDate()}</div>
                     </div>
-                    {entries.length > 0 && (
-                      <span style={{ color: doneCount === entries.length ? "#5dc8a0" : "var(--muted-text)", fontSize: 12 }}>{doneCount}/{entries.length} done</span>
-                    )}
+                    {entries.length > 0 && <span style={{ color: doneCount === entries.length ? "#5dc8a0" : "var(--muted-text)", fontSize: 12 }}>{doneCount}/{entries.length} done</span>}
                   </div>
                   <div style={{ display: "flex", gap: 4 }}>
-                    <button onClick={() => { setSelectedDay(i); openAdd(i, "skill"); }} style={{ padding: "4px 8px", borderRadius: 7, border: "none", background: isToday ? "var(--accent)" : "var(--border)", color: isToday ? "#fff" : "var(--muted-text)", cursor: "pointer", fontSize: 11 }}>+</button>
+                    <button onClick={() => { setSelectedDay(i); openAdd(i, "skill"); }} style={{ padding: "4px 8px", borderRadius: 7, border: "none", background: isToday ? "var(--accent)" : "var(--border)", color: isToday ? "#fff" : "var(--muted-text)", cursor: "pointer", fontSize: 11 }}>+ Skill</button>
+                    <button onClick={() => setPickModal({ type: "stretch", dayIdx: i })} style={{ padding: "4px 8px", borderRadius: 7, border: "none", background: "#7ecef533", color: "#7ecef5", cursor: "pointer", fontSize: 11 }}>🧘</button>
+                    <button onClick={() => setPickModal({ type: "conditioning", dayIdx: i })} style={{ padding: "4px 8px", borderRadius: 7, border: "none", background: "#5dc8a033", color: "#5dc8a0", cursor: "pointer", fontSize: 11 }}>💪</button>
                   </div>
                 </div>
                 {entries.length > 0 && (
                   <div style={{ background: "var(--card)", borderRadius: "0 0 14px 14px", border: "1px solid var(--border)", borderTop: "none", padding: "8px 12px", display: "flex", flexDirection: "column", gap: 6 }}>
                     {entries.map(entry => {
-                      const done = isDone(i, entry.id);
-                      const col  = ENTRY_COLORS[entry.type || "skill"] || "var(--accent)";
-                      const icon = entry.type === "stretch" ? "🧘" : entry.type === "conditioning" ? "💪" : (EVENT_ICONS[entry.event] || "🎯");
+                      const done = isEntryDoneForDay(i, entry);
+                      const col  = entryColor(entry);
                       return (
                         <div key={entry.id} style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                          <button onClick={() => toggleComplete(i, entry.id)} style={{ width: 22, height: 22, borderRadius: 6, border: `2px solid ${done ? col : "var(--border)"}`, background: done ? col : "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, color: "#fff", flexShrink: 0 }}>{done ? "✓" : ""}</button>
-                          <span style={{ fontSize: 12 }}>{icon}</span>
+                          <button onClick={() => (isToday || entry.type === "skill") ? toggleEntry(i, entry) : null}
+                            style={{ width: 22, height: 22, borderRadius: 6, border: `2px solid ${done ? col : "var(--border)"}`, background: done ? col : "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, color: "#fff", flexShrink: 0 }}>{done ? "✓" : ""}</button>
+                          <span style={{ fontSize: 12 }}>{entryIcon(entry)}</span>
                           <span style={{ flex: 1, color: done ? "var(--muted-text)" : "var(--text)", fontSize: 13, textDecoration: done ? "line-through" : "none" }}>{entry.name}</span>
                           {entry.sets && <span style={{ color: "var(--muted-text)", fontSize: 10 }}>{entry.sets}</span>}
                           <div style={{ display: "flex", gap: 3 }}>
@@ -5529,19 +5655,276 @@ function TrainingPlanner({ profile, onUpdateProfile }) {
   );
 }
 
+
+// ── USER REGISTRY ────────────────────────────────────────────────────────────
+
+// ── AUTH HELPERS ──────────────────────────────────────────────────────────────
+// Accounts stored raw (un-namespaced) at "gymtrack_accounts"
+// Each account: { id, username, pinHash }
+// Profile/data stored namespaced under u_<id>_<key>
+
+function hashPin(pin) {
+  // Simple deterministic hash — not cryptographic but fine for local PIN
+  let h = 5381;
+  for (let i = 0; i < pin.length; i++) h = ((h << 5) + h) ^ pin.charCodeAt(i);
+  return (h >>> 0).toString(36);
+}
+
+function loadAccounts() {
+  try { return JSON.parse(lsGetRaw("gymtrack_accounts") || "[]"); } catch { return []; }
+}
+function saveAccounts(accounts) {
+  lsSetRaw("gymtrack_accounts", JSON.stringify(accounts));
+}
+
+// Session: keep logged-in userId in sessionStorage so refreshing stays logged in
+// but closing the tab/browser logs out
+const SESSION_KEY = "gymtrack_session";
+function getSession() {
+  try { return sessionStorage.getItem(SESSION_KEY); } catch { return null; }
+}
+function setSession(userId) {
+  try { if (userId) sessionStorage.setItem(SESSION_KEY, userId); else sessionStorage.removeItem(SESSION_KEY); } catch {}
+}
+
+// ── Auth screen (Login / Sign Up) ─────────────────────────────────────────────
+function AuthScreen({ onLogin }) {
+  const [mode, setMode]         = useState("login"); // "login" | "signup"
+  const [username, setUsername] = useState("");
+  const [pin, setPin]           = useState("");
+  const [confirmPin, setConfirm]= useState("");
+  const [error, setError]       = useState("");
+  const [showPin, setShowPin]   = useState(false);
+  const [delMode, setDelMode]   = useState(false);
+  const [delUsername, setDelUsername] = useState("");
+  const [delPin, setDelPin]     = useState("");
+  const [delError, setDelError] = useState("");
+  const [delSuccess, setDelSuccess] = useState("");
+
+  const CSS = `:root { --bg:#0f0e17; --card:#1a1929; --border:#2d2b44; --text:#f0eeff; --muted-text:#7a78a0; --muted:#2d2b44; --input-bg:#13121f; --accent:#c97fd4; --accent-dim:#c97fd422; --font-display:'Georgia',serif; --font-body:system-ui,sans-serif; } * { margin:0; padding:0; box-sizing:border-box; } body { background:var(--bg); font-family:var(--font-body); } input { font-family:var(--font-body); outline:none; }`;
+
+  const handleSignup = () => {
+    setError("");
+    const u = username.trim().toLowerCase();
+    if (!u) { setError("Please enter a username."); return; }
+    if (u.length < 3) { setError("Username must be at least 3 characters."); return; }
+    if (!/^[a-z0-9_]+$/.test(u)) { setError("Username can only contain letters, numbers, and underscores."); return; }
+    if (pin.length < 4) { setError("PIN must be at least 4 digits."); return; }
+    if (pin !== confirmPin) { setError("PINs don't match."); return; }
+    const accounts = loadAccounts();
+    if (accounts.find(a => a.username === u)) { setError("That username is already taken."); return; }
+    const id = `u_${Date.now()}`;
+    const newAccount = { id, username: u, pinHash: hashPin(pin) };
+    saveAccounts([...accounts, newAccount]);
+    setSession(id);
+    setUserId(id);
+    onLogin({ id, username: u });
+  };
+
+  const handleLogin = () => {
+    setError("");
+    const u = username.trim().toLowerCase();
+    if (!u || !pin) { setError("Please enter your username and PIN."); return; }
+    const accounts = loadAccounts();
+    const account = accounts.find(a => a.username === u);
+    if (!account) { setError("Username not found."); return; }
+    if (account.pinHash !== hashPin(pin)) { setError("Incorrect PIN."); return; }
+    setSession(account.id);
+    setUserId(account.id);
+    onLogin(account);
+  };
+
+  const handleDelete = () => {
+    setDelError(""); setDelSuccess("");
+    const u = delUsername.trim().toLowerCase();
+    if (!u || !delPin) { setDelError("Enter your username and PIN to confirm."); return; }
+    const accounts = loadAccounts();
+    const account = accounts.find(a => a.username === u);
+    if (!account) { setDelError("Username not found."); return; }
+    if (account.pinHash !== hashPin(delPin)) { setDelError("Incorrect PIN."); return; }
+    // Wipe all namespaced data
+    const prefix = `u_${account.id}_`;
+    if (_hasLS) {
+      try {
+        const toDelete = [];
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i); if (k && k.startsWith(prefix)) toDelete.push(k);
+        }
+        toDelete.forEach(k => localStorage.removeItem(k));
+      } catch {}
+    }
+    Object.keys(_memStore).filter(k => k.startsWith(prefix)).forEach(k => delete _memStore[k]);
+    saveAccounts(accounts.filter(a => a.id !== account.id));
+    setDelSuccess("Account deleted.");
+    setTimeout(() => { setDelMode(false); setDelUsername(""); setDelPin(""); setDelSuccess(""); }, 2000);
+  };
+
+  const inputStyle = { width: "100%", padding: "13px 16px", borderRadius: 12, border: "2px solid var(--border)", background: "var(--input-bg)", color: "var(--text)", fontSize: 15, boxSizing: "border-box", marginBottom: 12 };
+
+  if (delMode) return (
+    <div style={{ minHeight: "100vh", background: "var(--bg)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24 }}>
+      <style>{CSS}</style>
+      <div style={{ width: "100%", maxWidth: 380 }}>
+        <div style={{ fontFamily: "var(--font-display)", color: "#c97fd4", fontSize: 26, letterSpacing: 1, textAlign: "center", marginBottom: 6 }}>✦ GymTrack</div>
+        <p style={{ color: "var(--muted-text)", fontSize: 13, textAlign: "center", marginBottom: 28 }}>Delete Account</p>
+        <p style={{ color: "var(--muted-text)", fontSize: 13, marginBottom: 16, lineHeight: 1.5 }}>Enter your username and PIN to permanently delete your account and all your data. This cannot be undone.</p>
+        <input value={delUsername} onChange={e => setDelUsername(e.target.value)} placeholder="Username" autoCapitalize="none" style={inputStyle} />
+        <input value={delPin} onChange={e => setDelPin(e.target.value.replace(/\D/g,"").slice(0,8))} placeholder="PIN" type="password" inputMode="numeric" style={inputStyle} />
+        {delError && <p style={{ color: "#e07b54", fontSize: 13, marginBottom: 12 }}>{delError}</p>}
+        {delSuccess && <p style={{ color: "#5dc8a0", fontSize: 13, marginBottom: 12 }}>{delSuccess}</p>}
+        <button onClick={handleDelete} style={{ width: "100%", padding: "14px", borderRadius: 12, border: "none", background: "#e07b54", color: "#fff", cursor: "pointer", fontFamily: "var(--font-display)", fontSize: 15, fontWeight: 700, marginBottom: 12 }}>Delete My Account</button>
+        <button onClick={() => setDelMode(false)} style={{ width: "100%", padding: "12px", borderRadius: 12, border: "1px solid var(--border)", background: "transparent", color: "var(--muted-text)", cursor: "pointer", fontSize: 14 }}>← Back</button>
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{ minHeight: "100vh", background: "var(--bg)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24 }}>
+      <style>{CSS}</style>
+      <div style={{ width: "100%", maxWidth: 380 }}>
+        {/* Logo */}
+        <div style={{ fontFamily: "var(--font-display)", color: "#c97fd4", fontSize: 28, letterSpacing: 1, textAlign: "center", marginBottom: 6 }}>✦ GymTrack</div>
+        <p style={{ color: "var(--muted-text)", fontSize: 13, textAlign: "center", marginBottom: 32 }}>
+          {mode === "login" ? "Welcome back, gymnast!" : "Create your account"}
+        </p>
+
+        {/* Mode tabs */}
+        <div style={{ display: "flex", background: "var(--card)", borderRadius: 12, padding: 4, marginBottom: 24, gap: 4 }}>
+          {[["login","Log In"],["signup","Sign Up"]].map(([m, label]) => (
+            <button key={m} onClick={() => { setMode(m); setError(""); setPin(""); setConfirm(""); }}
+              style={{ flex: 1, padding: "10px", borderRadius: 9, border: "none", cursor: "pointer", fontSize: 14, fontWeight: mode === m ? 700 : 400, background: mode === m ? "#c97fd4" : "transparent", color: mode === m ? "#fff" : "var(--muted-text)", transition: "all .2s" }}>
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {/* Username */}
+        <p style={{ color: "var(--muted-text)", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 6 }}>Username</p>
+        <input
+          value={username}
+          onChange={e => { setUsername(e.target.value); setError(""); }}
+          onKeyDown={e => e.key === "Enter" && (mode === "login" ? handleLogin() : null)}
+          placeholder={mode === "signup" ? "e.g. sarah_gym (letters, numbers, _)" : "Your username"}
+          autoCapitalize="none" autoCorrect="off" spellCheck="false"
+          style={inputStyle}
+        />
+
+        {/* PIN */}
+        <p style={{ color: "var(--muted-text)", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 6 }}>
+          PIN {mode === "signup" ? "(4–8 digits)" : ""}
+        </p>
+        <div style={{ position: "relative", marginBottom: 12 }}>
+          <input
+            value={pin}
+            onChange={e => { setPin(e.target.value.replace(/\D/g,"").slice(0,8)); setError(""); }}
+            onKeyDown={e => e.key === "Enter" && (mode === "login" ? handleLogin() : null)}
+            placeholder="••••"
+            type={showPin ? "text" : "password"}
+            inputMode="numeric"
+            style={{ ...inputStyle, marginBottom: 0, paddingRight: 48 }}
+          />
+          <button onClick={() => setShowPin(s => !s)}
+            style={{ position: "absolute", right: 14, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", color: "var(--muted-text)", cursor: "pointer", fontSize: 16 }}>
+            {showPin ? "🙈" : "👁"}
+          </button>
+        </div>
+
+        {/* Confirm PIN (signup only) */}
+        {mode === "signup" && (
+          <>
+            <p style={{ color: "var(--muted-text)", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 6 }}>Confirm PIN</p>
+            <input
+              value={confirmPin}
+              onChange={e => { setConfirm(e.target.value.replace(/\D/g,"").slice(0,8)); setError(""); }}
+              onKeyDown={e => e.key === "Enter" && handleSignup()}
+              placeholder="••••"
+              type={showPin ? "text" : "password"}
+              inputMode="numeric"
+              style={inputStyle}
+            />
+          </>
+        )}
+
+        {error && <p style={{ color: "#e07b54", fontSize: 13, marginBottom: 14 }}>⚠ {error}</p>}
+
+        <button
+          onClick={mode === "login" ? handleLogin : handleSignup}
+          style={{ width: "100%", padding: "15px", borderRadius: 12, border: "none", background: "#c97fd4", color: "#fff", cursor: "pointer", fontFamily: "var(--font-display)", fontSize: 16, fontWeight: 700, marginBottom: 16 }}>
+          {mode === "login" ? "Log In →" : "Create Account →"}
+        </button>
+
+        <button onClick={() => setDelMode(true)}
+          style={{ width: "100%", padding: "10px", borderRadius: 10, border: "none", background: "transparent", color: "var(--muted-text)", cursor: "pointer", fontSize: 12 }}>
+          Delete my account
+        </button>
+      </div>
+    </div>
+  );
+}
+
+
 // ── MAIN APP ─────────────────────────────────────────────────────────────────
 
 export default function App() {
+  // ── Auth ──────────────────────────────────────────────────────────────────
+  // On mount, check sessionStorage for a live session so refresh stays logged in.
+  const [loggedInUser, setLoggedInUser] = useState(() => {
+    const sessionId = getSession();
+    if (!sessionId) return null;
+    const accounts = loadAccounts();
+    const account = accounts.find(a => a.id === sessionId);
+    if (account) { setUserId(account.id); return account; }
+    return null;
+  });
+
+  const handleLogin = (account) => {
+    setLoggedInUser(account);
+  };
+
+  const handleLogout = () => {
+    setSession(null);
+    setUserId(null);
+    setLoggedInUser(null);
+    // Reset all per-user state
+    setProfile(null);
+    setSkillProgress({});
+    setVideos([]);
+    setPlan({});
+    setCheckedToday([]);
+    setCustomStretches(STRETCHES);
+    setCustomConditioning(CONDITIONING);
+    setGlobalXP(0);
+    setScreen("home");
+  };
+
+  // ── Per-user state (all namespaced via userKey() in storage layer) ─────────
   const [profile, setProfile] = useStorage("gymnast_profile", null);
   const [screen, setScreen]   = useState("home");
   const [skillProgress, setSkillProgress] = useStorage("skill_progress", {});
   const [videos, setVideos]   = useStorage("video_library", []);
+  const [plan, setPlan]       = useStorage("training_plan", {});
 
   const todayKey = "conditioning_" + new Date().toDateString();
-  const [checkedToday] = useStorage(todayKey, []);
+  const [checkedToday, setCheckedToday] = useStorage(todayKey, []);
+  const [customStretches, setCustomStretches] = useStorage("custom_stretches", STRETCHES);
+  const [customConditioning, setCustomConditioning] = useStorage("custom_conditioning", CONDITIONING);
 
   const [globalXP, setGlobalXP] = useStorage("total_xp_cache", 0);
   const [xpBump, setXpBump]     = useState(null);
+
+  // Re-initialise per-user state when a different user logs in
+  useEffect(() => {
+    if (!loggedInUser) return;
+    try { const s = lsGet("gymnast_profile"); setProfile(s ? JSON.parse(s) : null); } catch { setProfile(null); }
+    try { const s = lsGet("skill_progress"); setSkillProgress(s ? JSON.parse(s) : {}); } catch { setSkillProgress({}); }
+    try { const s = lsGet("video_library"); setVideos(s ? JSON.parse(s) : []); } catch { setVideos([]); }
+    try { const s = lsGet("training_plan"); setPlan(s ? JSON.parse(s) : {}); } catch { setPlan({}); }
+    try { const s = lsGet("total_xp_cache"); setGlobalXP(s ? JSON.parse(s) : 0); } catch { setGlobalXP(0); }
+    try { const s = lsGet("custom_stretches"); setCustomStretches(s ? JSON.parse(s) : STRETCHES); } catch { setCustomStretches(STRETCHES); }
+    try { const s = lsGet("custom_conditioning"); setCustomConditioning(s ? JSON.parse(s) : CONDITIONING); } catch { setCustomConditioning(CONDITIONING); }
+    try { const s = lsGet(todayKey); setCheckedToday(s ? JSON.parse(s) : []); } catch { setCheckedToday([]); }
+    setScreen("home");
+  }, [loggedInUser?.id]);
 
   const handleOnboard  = (data) => setProfile(data);
   const updateProfile  = (data) => setProfile(data);
@@ -5583,6 +5966,8 @@ export default function App() {
     @keyframes toastIn { from { opacity:0; transform: translateX(-50%) translateY(-12px); } to { opacity:1; transform: translateX(-50%) translateY(0); } }
   `;
 
+  if (!loggedInUser) return <AuthScreen onLogin={handleLogin} />;
+
   if (!profile) return (
     <>
       <style>{CSS}</style>
@@ -5607,7 +5992,8 @@ export default function App() {
             <span style={{ color: "var(--muted-text)", fontSize: 11 }}>{profile.name}</span>
             <span style={{ color: getXPLevel(globalXP).color, fontSize: 10, fontWeight: 700 }}>{getXPLevel(globalXP).title}</span>
           </div>
-          <div onClick={() => setScreen("home")} style={{ width: 32, height: 32, borderRadius: 10, background: "var(--accent-dim)", border: `2px solid var(--accent)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, cursor: "pointer" }}>{t(profile.icon)}</div>
+          <div onClick={() => setScreen("home")} style={{ width: 32, height: 32, borderRadius: 10, background: "var(--accent-dim)", border: `2px solid var(--accent)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, cursor: "pointer" }} title="Go home">{t(profile.icon)}</div>
+          <button onClick={handleLogout} style={{ background: "var(--input-bg)", border: "1px solid var(--border)", borderRadius: 8, color: "var(--muted-text)", width: 32, height: 32, cursor: "pointer", fontSize: 13, display: "flex", alignItems: "center", justifyContent: "center" }} title="Log out">🚪</button>
         </div>
       </div>
 
@@ -5616,8 +6002,8 @@ export default function App() {
         {screen === "home"         && <Home profile={profile} onUpdateProfile={updateProfile} onNavigate={setScreen} />}
         {screen === "dashboard"    && <Dashboard profile={profile} skillProgress={skillProgress} checkedToday={checkedToday} />}
         {screen === "skills"       && <SkillTracker profile={profile} skillProgress={skillProgress} setSkillProgress={handleSetSkills} onXPGain={handleXPGain} onUpdateProfile={updateProfile} />}
-        {screen === "conditioning" && <Conditioning onXPGain={handleXPGain} profile={profile} onUpdateProfile={updateProfile} />}
-        {screen === "planner"      && <TrainingPlanner profile={profile} onUpdateProfile={updateProfile} />}
+        {screen === "conditioning" && <Conditioning onXPGain={handleXPGain} profile={profile} onUpdateProfile={updateProfile} checked={checkedToday} setChecked={setCheckedToday} customStretches={customStretches} setCustomStretches={setCustomStretches} customConditioning={customConditioning} setCustomConditioning={setCustomConditioning} plan={plan} />}
+        {screen === "planner"      && <TrainingPlanner profile={profile} onUpdateProfile={updateProfile} checked={checkedToday} setChecked={setCheckedToday} customStretches={customStretches} customConditioning={customConditioning} plan={plan} setPlan={setPlan} />}
         {screen === "progress"     && <ProgressScreen profile={profile} skillProgress={skillProgress} onNavigate={setScreen} onUpdateProfile={updateProfile} />}
         {screen === "achievements" && <AchievementsScreen profile={profile} skillProgress={skillProgress} onUpdateProfile={updateProfile} />}
         {screen === "videos"       && <VideoLibrary videos={videos} setVideos={setVideos} />}
